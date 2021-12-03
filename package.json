@@ -5,18 +5,31 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "fmt": "prettier -w src",
+    "tauri": "tauri"
   },
   "dependencies": {
+    "@emotion/react": "^11.7.0",
+    "@emotion/styled": "^11.6.0",
+    "@mui/material": "^5.2.2",
+    "@tauri-apps/api": "^1.0.0-beta.8",
+    "immer": "^9.0.7",
     "next": "12.0.4",
     "react": "17.0.2",
-    "react-dom": "17.0.2"
+    "react-dom": "17.0.2",
+    "use-immer": "^0.6.0",
+    "uuid": "^8.3.2"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^1.0.0-beta.10",
     "@types/node": "16.11.11",
     "@types/react": "17.0.37",
+    "@types/react-dom": "^17.0.11",
+    "@types/uuid": "^8.3.3",
     "eslint": "7",
     "eslint-config-next": "12.0.4",
+    "prettier": "^2.4.1",
     "typescript": "4.5.2"
   }
 }

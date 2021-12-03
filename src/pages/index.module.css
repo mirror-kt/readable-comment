@@ -1,0 +1,20 @@
+.comment-paper {
+    width: 200px;
+    margin-bottom: 10px;
+    padding: 10px;
+    animation: fadein 0.5s;
+}
+
+@keyframes fadein {
+    from {
+        background-color: #1976d2;
+    }
+    to {
+        background-color: inherit;
+    }
+}
+
+.comment-container {
+    height: 100%;
+    padding: 10px;
+}
