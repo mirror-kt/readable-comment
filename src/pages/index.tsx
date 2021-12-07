@@ -2,39 +2,50 @@ import * as React from "react";
 import type { NextPage } from "next";
 import Paper from "@mui/material/Paper";
 import { useImmer } from "use-immer";
-import { v4 as uuidv4 } from "uuid";
+import { nanoid } from "nanoid";
 import { getCurrent } from "@tauri-apps/api/window";
 
 import styles from "./index.module.css";
 
+type CommentElement =
+    | {
+          type: "text";
+          content: string;
+      }
+    | {
+          type: "emoji";
+          url: string;
+      };
+
+type Comment = {
+    id: string;
+    elements: Array<CommentElement>;
+};
+
 type CommentPaperProps = { comment: Comment; styles?: React.CSSProperties };
 const CommentPaper: React.FC<CommentPaperProps> = ({ comment, styles: s }) => (
     <Paper className={styles["comment-paper"]} style={s}>
-        {comment.content}
+        {comment.elements.map((v, i) => {
+            switch (v.type) {
+                case "text":
+                    return <span key={i}>{v.content}</span>;
+                case "emoji":
+                    return <img key={i} src={v.url} style={{ height: "1.2em" }} />;
+            }
+        })}
     </Paper>
 );
-
-type Comment = {
-    id: string; // for debug purposes
-    content: string;
-};
 
 function assertNotNull<T>(v: T | null | undefined): asserts v is Exclude<T, null | undefined> {
     console.assert(v != null);
 }
-
-const withConsoleGroup = (f: () => void) => {
-    console.group();
-    f();
-    console.groupEnd();
-};
 
 class CommentEventBus {
     public constructor(private eventListeners: Record<string, (c: Comment) => void> = {}) {}
 
     // returns ID of listener to use on removeListner method.
     public listen(f: (c: Comment) => void): string {
-        const id = uuidv4();
+        const id = nanoid();
         this.eventListeners[id] = f;
         return id;
     }
@@ -95,66 +106,64 @@ const Comments: React.FC<CommentsProps> = ({ eventBus }) => {
     }, [eventBus]);
 
     React.useLayoutEffect(() => {
-        withConsoleGroup(() => {
-            if (tryPutComment == null) {
-                return;
+        if (tryPutComment == null) {
+            return;
+        }
+
+        // mesuring queued. let's measure its height and put it to desired layer.
+        assertNotNull(commentRef.current);
+        const children = commentRef.current.children;
+
+        const target = children[0] as HTMLElement;
+        const height = elementHeight(target);
+        console.assert(height !== 0);
+
+        // |(1-1)| => 0
+        // |(0-1)| => |-1| => 1
+        const alternateLayer = (x: number) => Math.abs(x - 1);
+
+        const containerHeight = commentRef.current.clientHeight;
+        let oldLayer = alternateLayer(appendingLayer);
+        let currentLayer = appendingLayer;
+        let usedHeight = shownCommentLayers[currentLayer]
+            .map((x) => x.height)
+            .reduce((a, b) => a + b, 0);
+
+        if (usedHeight + height > containerHeight) {
+            oldLayer = appendingLayer;
+            currentLayer = alternateLayer(appendingLayer);
+            usedHeight = 0;
+
+            setAppendingLayer(currentLayer);
+        }
+
+        const oldLayerTop = shownCommentLayers[oldLayer].reduce(
+            (a, b) => Math.min(a, b.top),
+            Infinity
+        );
+
+        const leftSpace = oldLayerTop - usedHeight;
+        let remainingHeight = height - leftSpace;
+        let deleteCount = 0;
+
+        for (const c of shownCommentLayers[oldLayer]) {
+            if (remainingHeight <= 0) {
+                break;
             }
 
-            // mesuring queued. let's measure its height and put it to desired layer.
-            assertNotNull(commentRef.current);
-            const children = commentRef.current.children;
+            deleteCount += 1;
+            remainingHeight -= c.height;
+        }
 
-            const target = children[0] as HTMLElement;
-            const height = elementHeight(target);
-            console.assert(height !== 0);
-
-            // |(1-1)| => 0
-            // |(0-1)| => |-1| => 1
-            const alternateLayer = (x: number) => Math.abs(x - 1);
-
-            const containerHeight = commentRef.current.clientHeight;
-            let oldLayer = alternateLayer(appendingLayer);
-            let currentLayer = appendingLayer;
-            let usedHeight = shownCommentLayers[currentLayer]
-                .map((x) => x.height)
-                .reduce((a, b) => a + b, 0);
-
-            if (usedHeight + height > containerHeight) {
-                oldLayer = appendingLayer;
-                currentLayer = alternateLayer(appendingLayer);
-                usedHeight = 0;
-
-                setAppendingLayer(currentLayer);
+        setShownCommentLayers((comments) => {
+            for (let i = 0; i < deleteCount; i++) {
+                comments[oldLayer].shift();
             }
-
-            const oldLayerTop = shownCommentLayers[oldLayer].reduce(
-                (a, b) => Math.min(a, b.top),
-                Infinity
-            );
-
-            const leftSpace = oldLayerTop - usedHeight;
-            let remainingHeight = height - leftSpace;
-            let deleteCount = 0;
-
-            for (const c of shownCommentLayers[oldLayer]) {
-                if (remainingHeight <= 0) {
-                    break;
-                }
-
-                deleteCount += 1;
-                remainingHeight -= c.height;
-            }
-
-            setShownCommentLayers((comments) => {
-                for (let i = 0; i < deleteCount; i++) {
-                    comments[oldLayer].shift();
-                }
-                comments[currentLayer].push({ top: usedHeight, height, comment: tryPutComment });
-                comments.forEach((x) => x.sort((a, b) => a.top - b.top));
-            });
-
-            setTryPutComment(null);
+            comments[currentLayer].push({ top: usedHeight, height, comment: tryPutComment });
+            comments.forEach((x) => x.sort((a, b) => a.top - b.top));
         });
+
+        setTryPutComment(null);
     }, [commentRef, shownCommentLayers, tryPutComment, appendingLayer, setShownCommentLayers]);
 
     const inner = [];
@@ -191,8 +200,8 @@ const Home: NextPage = () => {
         setVisible(true);
         (async () => {
             await getCurrent().listen("comment", (e) => {
-                const content = (e as any).payload.content as string;
-                const comment = { id: uuidv4(), content };
+                const elements = (e as any).payload.elements as Array<CommentElement>;
+                const comment = { id: nanoid(), elements };
                 eventBus.current.emit(comment);
             });
         })();
