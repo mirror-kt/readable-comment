@@ -8,18 +8,16 @@ use headless_chrome::{
     protocol::network::{
         events::ResponseReceivedEventParams, methods::GetResponseBodyReturnObject,
     },
-    Browser, LaunchOptionsBuilder,
+    Browser, LaunchOptionsBuilder, Tab,
 };
 use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
     task::Poll,
-    thread::sleep,
     time::{Duration, Instant},
 };
 use tauri::Window;
-use tokio::task::block_in_place;
 use tokio::{
     runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime},
     sync::Mutex,
@@ -46,9 +44,8 @@ fn main() -> Result<()> {
         webview: Mutex::new(None),
     });
 
-    context
-        .rt
-        .spawn(YoutubeListener::new(Arc::clone(&context), todo!("put video id here")).start());
+    let (browser, tab) =
+        YoutubeListener::new(Arc::clone(&context), todo!("put video id here")).start();
 
     tauri::Builder::default()
         .on_page_load(move |window, _| {
@@ -96,35 +93,30 @@ impl YoutubeListener {
         }
     }
 
-    pub(crate) async fn start(self) {
+    pub(crate) fn start(self) -> (Browser, Arc<Tab>) {
         // starting browser is heavy task, so we must use block_in_place
         // for not blocking any task on the same thread.
         // also block_in_place must return browser and tab not to run their destructors.
-        let (_browser, _tab) = block_in_place(move || {
-            let opt = LaunchOptionsBuilder::default()
-                .headless(false)
-                .build()
-                .unwrap();
-
-            let browser = Browser::new(opt).unwrap();
-            let tab = browser.new_tab().unwrap();
-
-            tab.enable_log().unwrap();
-
-            tab.navigate_to(&format!(
-                "https://www.youtube.com/live_chat?v={}",
-                self.inner.video_id
-            ))
+        let opt = LaunchOptionsBuilder::default()
+            .headless(false)
+            .build()
             .unwrap();
 
-            tab.enable_response_handling(Box::new(move |a, b| self.on_response(a, b)))
-                .unwrap();
+        let browser = Browser::new(opt).unwrap();
+        let tab = browser.wait_for_initial_tab().unwrap();
 
-            (browser, tab)
-        });
+        tab.enable_log().unwrap();
 
-        // prevent to run destructors
-        Empty.await;
+        tab.navigate_to(&format!(
+            "https://www.youtube.com/live_chat?v={}",
+            self.inner.video_id
+        ))
+        .unwrap();
+
+        tab.enable_response_handling(Box::new(move |a, b| self.on_response(a, b)))
+            .unwrap();
+
+        (browser, tab)
     }
 
     fn on_response(
@@ -132,7 +124,6 @@ impl YoutubeListener {
         param: ResponseReceivedEventParams,
         fetch: &dyn Fn() -> Result<GetResponseBodyReturnObject, failure::Error>,
     ) {
-        tracing::trace!("fetch from {}", param.response.url);
         if !param
             .response
             .url
@@ -141,8 +132,8 @@ impl YoutubeListener {
             return;
         }
 
-        const POLL_COUNT: usize = 10;
-        const POLL_INTERVAL: Duration = Duration::from_millis(500);
+        const POLL_COUNT: usize = 50;
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
         let id = param.request_id;
 
@@ -151,7 +142,7 @@ impl YoutubeListener {
         // we don't have a way to be notified when chromium completed to fetch,
         // so using polling instead.
         'poll: for _ in 0..POLL_COUNT {
-            sleep(POLL_INTERVAL);
+            std::thread::sleep(POLL_INTERVAL);
             match fetch() {
                 Ok(data) if data.body.trim().is_empty() => {
                     tracing::warn!("id: {}: empty body. retrying", id);
@@ -159,7 +150,16 @@ impl YoutubeListener {
                 }
 
                 Ok(data) => {
-                    self.on_comment(data.body);
+                    // We should return from this function as soon as possible because
+                    // this `on_response` function is called by headless_chrome crate
+                    // *synchronously in event loop*. Blocking on this function too long time
+                    // causes dropping browser event or connection lost.
+                    // This is why using `spawn` instead of `block_on`.
+                    let inner = Arc::clone(&self.inner);
+                    self.inner
+                        .ctx
+                        .rt
+                        .spawn(async move { inner.on_comment(data.body).await });
                     return;
                 }
 
@@ -172,57 +172,59 @@ impl YoutubeListener {
 
         tracing::warn!("couldn't fetch request's body");
     }
+}
 
-    fn on_comment(&self, json_str: String) {
-        let me = Arc::clone(&self.inner);
-        let fut = async move {
-            let raw: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-            let comments = Self::parse_json(&raw)?;
-
-            let normalize_duration = {
-                // used on first fetch where last_comment_fetch isn't set
-                const DEFAULT_FETCH_PERIOD_SECS: f64 = 5.2;
-
-                let now = Instant::now();
-                let elapsed_time_from_last_fetch = me
-                    .last_comment_fetch
-                    .lock()
-                    .await
-                    .replace(now)
-                    .map(|x| now - x)
-                    .unwrap_or(Duration::from_secs_f64(DEFAULT_FETCH_PERIOD_SECS));
-
-                let mut comment_fetch_period = me.comment_fetch_period.lock().await;
-                comment_fetch_period.put(elapsed_time_from_last_fetch);
-
-                let average = comment_fetch_period.average();
-                average
-            };
-
-            tracing::trace!("comments: {}", comments.len());
-            tracing::trace!("fetch_period: {:?}", me.comment_fetch_period.lock().await);
-            tracing::info!(
-                "{:.2} comments/s",
-                comments.len() as f64 / normalize_duration.as_secs_f64()
-            );
-            let sleep_time_of_one_loop = normalize_duration / (comments.len() as u32);
-            for c in comments {
-                me.ctx
-                    .webview
-                    .lock()
-                    .await
-                    .as_ref()
-                    .unwrap()
-                    .emit("comment", c)
-                    .unwrap();
-
-                sleep(sleep_time_of_one_loop);
-            }
-
-            Some(())
+impl YoutubeListenerInner {
+    async fn on_comment(&self, json_str: String) {
+        let raw: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let comments = match Self::parse_json(&raw) {
+            Some(t) => t,
+            None => return,
         };
 
-        self.inner.ctx.rt.spawn(fut);
+        let normalize_duration = {
+            // used on first fetch where last_comment_fetch isn't set
+            const DEFAULT_FETCH_PERIOD_SECS: f64 = 5.2;
+
+            let now = Instant::now();
+            let elapsed_time_from_last_fetch = self
+                .last_comment_fetch
+                .lock()
+                .await
+                .replace(now)
+                .map(|x| now - x)
+                .unwrap_or(Duration::from_secs_f64(DEFAULT_FETCH_PERIOD_SECS));
+
+            let mut comment_fetch_period = self.comment_fetch_period.lock().await;
+            comment_fetch_period.put(elapsed_time_from_last_fetch);
+
+            let average = comment_fetch_period.average();
+            average
+        };
+
+        tracing::trace!("comments: {}", comments.len());
+        tracing::trace!("fetch_period: {:?}", self.comment_fetch_period.lock().await);
+        tracing::info!(
+            "{:.2} comments/s",
+            comments.len() as f64 / normalize_duration.as_secs_f64()
+        );
+
+        let sleep_time_of_one_loop = normalize_duration / (comments.len() as u32);
+        for c in comments {
+            self.emit("comment", c).await;
+            tokio::time::sleep(sleep_time_of_one_loop).await;
+        }
+    }
+
+    async fn emit(&self, event: &str, payload: impl serde::Serialize) {
+        self.ctx
+            .webview
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .emit(event, payload)
+            .unwrap();
     }
 
     fn parse_json(raw: &serde_json::Value) -> Option<Vec<SerializedComment<'_>>> {
@@ -233,68 +235,54 @@ impl YoutubeListener {
             .as_array()?
             .iter()
             .flat_map(|x| {
-                let t = x
-                    .get("addChatItemAction")?
-                    .get("item")?
-                    .get("liveChatTextMessageRenderer")?;
-                Some(t)
+                Some(
+                    x.get("addChatItemAction")?
+                        .get("item")?
+                        .get("liveChatTextMessageRenderer")?
+                        .get("message")?
+                        .get("runs")?
+                        .as_array()?,
+                )
             })
-            .flat_map(|x| {
-                let runs = x.get("message")?.get("runs")?.as_array()?;
-                Self::parse_message_runs(runs)
-            })
-            .collect::<Vec<SerializedComment>>();
+            .map(|r| r.iter().flat_map(Self::run_to_element).collect())
+            .flat_map(SerializedComment::new)
+            .collect();
 
         Some(comments)
     }
 
-    fn parse_message_runs(runs: &Vec<serde_json::Value>) -> Option<SerializedComment<'_>> {
-        let elements = runs
-            .iter()
-            .flat_map(|run| -> Option<CommentElement> {
-                if let Some(emoji) = run.get("emoji") {
-                    let image_candidates = emoji.get("image")?.get("thumbnails")?.as_array()?;
-                    let image_object = match image_candidates.len() {
-                        0 => return None,
-                        1 => &image_candidates[0],
-                        _ => image_candidates
-                            .iter()
-                            .flat_map(|x| {
-                                // remove object which doesn't have width property
-                                let width = x.get("width");
-                                if matches!(width, Some(t) if t.is_i64()) {
-                                    Some(x)
-                                } else {
-                                    None
-                                }
-                            })
-                            .max_by_key(|x| x.get("width").unwrap().as_i64())?,
-                    };
+    fn run_to_element(run: &serde_json::Value) -> Option<CommentElement<'_>> {
+        if let Some(emoji) = run.get("emoji") {
+            let image_candidates = emoji.get("image")?.get("thumbnails")?.as_array()?;
+            let image_object = match image_candidates.len() {
+                0 => return None,
+                1 => &image_candidates[0],
+                _ => image_candidates
+                    .iter()
+                    .flat_map(|x| {
+                        // remove object which doesn't have width property
+                        let width = x.get("width");
+                        if matches!(width, Some(t) if t.is_i64()) {
+                            Some(x)
+                        } else {
+                            None
+                        }
+                    })
+                    .max_by_key(|x| x.get("width").unwrap().as_i64())?,
+            };
 
-                    return Some(CommentElement::Emoji {
-                        url: image_object.get("url")?.as_str()?,
-                    });
-                }
-
-                if let Some(text) = run.get("text") {
-                    return Some(CommentElement::Text {
-                        content: text.as_str()?,
-                    });
-                }
-
-                None
-            })
-            .collect::<Vec<_>>();
-
-        if elements.len() == 0 {
-            return None;
+            return Some(CommentElement::Emoji {
+                url: image_object.get("url")?.as_str()?,
+            });
         }
 
-        if elements.len() != 0 {
-            Some(SerializedComment { elements })
-        } else {
-            None
+        if let Some(text) = run.get("text") {
+            return Some(CommentElement::Text {
+                content: text.as_str()?,
+            });
         }
+
+        None
     }
 }
 
@@ -303,6 +291,16 @@ impl YoutubeListener {
 #[serde(rename_all = "camelCase")]
 struct SerializedComment<'a> {
     elements: Vec<CommentElement<'a>>,
+}
+
+impl<'a> SerializedComment<'a> {
+    fn new(elements: Vec<CommentElement<'a>>) -> Option<Self> {
+        if elements.is_empty() {
+            None
+        } else {
+            Some(Self { elements })
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
