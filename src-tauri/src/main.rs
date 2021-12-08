@@ -44,8 +44,10 @@ fn main() -> Result<()> {
         webview: Mutex::new(None),
     });
 
-    let (_browser, _tab) =
-        YoutubeListener::new(Arc::clone(&context), todo!("put video id here")).start();
+    // failure::Error doesn't implement std::error::Error.
+    let (_browser, _tab) = YoutubeListener::new(Arc::clone(&context), todo!("put video id here"))
+        .start()
+        .expect("failed to initialize youtube listener");
 
     tauri::Builder::default()
         .on_page_load(move |window, _| {
@@ -93,30 +95,34 @@ impl YoutubeListener {
         }
     }
 
-    pub(crate) fn start(self) -> (Browser, Arc<Tab>) {
-        // starting browser is heavy task, so we must use block_in_place
-        // for not blocking any task on the same thread.
-        // also block_in_place must return browser and tab not to run their destructors.
+    pub(crate) fn start(self) -> Result<(Browser, Arc<Tab>), failure::Error> {
         let opt = LaunchOptionsBuilder::default()
             .headless(false)
             .build()
             .unwrap();
 
-        let browser = Browser::new(opt).unwrap();
-        let tab = browser.wait_for_initial_tab().unwrap();
+        let browser = Browser::new(opt)?;
+        let tab = browser.wait_for_initial_tab()?;
 
-        tab.enable_log().unwrap();
+        tab.enable_log()?;
 
         tab.navigate_to(&format!(
             "https://www.youtube.com/live_chat?v={}",
             self.inner.video_id
-        ))
-        .unwrap();
+        ))?;
 
-        tab.enable_response_handling(Box::new(move |a, b| self.on_response(a, b)))
-            .unwrap();
+        tab.enable_response_handling(Box::new(move |a, b| self.on_response(a, b)))?;
 
-        (browser, tab)
+        // why this element has this too short ID?
+        tab.wait_for_element_with_custom_timeout("#label", Duration::from_secs(10))?
+            .click()?;
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        tab.wait_for_element("#menu > a:nth-child(2) > tp-yt-paper-item")?
+            .click()?;
+
+        Ok((browser, tab))
     }
 
     fn on_response(
@@ -214,14 +220,17 @@ impl YoutubeListenerInner {
     }
 
     async fn emit(&self, event: &str, payload: impl serde::Serialize) {
-        self.ctx
-            .webview
-            .lock()
-            .await
-            .as_ref()
-            .unwrap()
-            .emit(event, payload)
-            .unwrap();
+        let webview = self.ctx.webview.lock().await;
+
+        if let Some(w) = webview.as_ref() {
+            w.emit(event, payload)
+                .expect("failed to emit event to webview");
+        } else {
+            tracing::warn!(
+                "failed to emit event \"{}\" because webview is not initialized yet.",
+                event
+            )
+        }
     }
 
     fn parse_json(raw: &serde_json::Value) -> Option<Vec<SerializedComment<'_>>> {
@@ -286,7 +295,7 @@ impl YoutubeListenerInner {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Stats {
-    comments_per_sec: f64
+    comments_per_sec: f64,
 }
 
 #[derive(serde::Serialize)]
