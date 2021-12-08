@@ -1,8 +1,27 @@
+.index-container {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    height: 100%;
+}
+
+.stats-container {
+    padding: 10px;
+    margin: 10px;
+    color: white;
+    height: fit-content;
+}
+
+.comment-container {
+    height: 100%;
+    padding: 10px;
+}
+
 .comment-paper {
     width: 400px;
     margin-bottom: 10px;
     padding: 10px;
-    animation: fadein 0.5s;
+    animation: fadein 0.2s;
 }
 
 @keyframes fadein {
@@ -12,9 +31,4 @@
     to {
         background-color: inherit;
     }
-}
-
-.comment-container {
-    height: 100%;
-    padding: 10px;
 }

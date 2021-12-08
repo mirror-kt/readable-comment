@@ -44,7 +44,7 @@ fn main() -> Result<()> {
         webview: Mutex::new(None),
     });
 
-    let (browser, tab) =
+    let (_browser, _tab) =
         YoutubeListener::new(Arc::clone(&context), todo!("put video id here")).start();
 
     tauri::Builder::default()
@@ -202,12 +202,9 @@ impl YoutubeListenerInner {
             average
         };
 
-        tracing::trace!("comments: {}", comments.len());
-        tracing::trace!("fetch_period: {:?}", self.comment_fetch_period.lock().await);
-        tracing::info!(
-            "{:.2} comments/s",
-            comments.len() as f64 / normalize_duration.as_secs_f64()
-        );
+        let comments_per_sec = comments.len() as f64 / normalize_duration.as_secs_f64();
+
+        self.emit("stats", Stats { comments_per_sec }).await;
 
         let sleep_time_of_one_loop = normalize_duration / (comments.len() as u32);
         for c in comments {
@@ -287,7 +284,12 @@ impl YoutubeListenerInner {
 }
 
 #[derive(serde::Serialize)]
-#[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
+struct Stats {
+    comments_per_sec: f64
+}
+
+#[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SerializedComment<'a> {
     elements: Vec<CommentElement<'a>>,
