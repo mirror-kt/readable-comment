@@ -1,13 +1,14 @@
 import * as React from "react";
-import type { NextPage } from "next";
+import * as ReactDOM from "react-dom";
 import Paper from "@mui/material/Paper";
 import { useImmer } from "use-immer";
 import { nanoid } from "nanoid";
+import { createTheme, ThemeProvider } from "@mui/material/styles";
+import "./globals.css";
+
 import { getCurrent } from "@tauri-apps/api/window";
 
 import styles from "./index.module.css";
-
-const setImmediate = (f: () => void) => setTimeout(f, 0);
 
 type CommentElement =
     | {
@@ -28,19 +29,19 @@ type CommentPaperProps = { comment: Comment; styles?: React.CSSProperties };
 const CommentPaper: React.FC<CommentPaperProps> = ({ comment, styles: s }) => (
     <Paper className={styles["comment-paper"]} style={s}>
         {comment.elements.map((v, i) => {
-            switch (v.type) {
+            const ty = v.type;
+            switch (ty) {
                 case "text":
                     return <span key={i}>{v.content}</span>;
                 case "emoji":
-                    return <img key={i} src={v.url} style={{ height: "1.2em" }} />;
+                    return <img key={i} src={v.url} alt="emoji" style={{ height: "1.2em" }} />;
+                default:
+                    console.warn(`unknown comment type: ${ty}`);
+                    return null;
             }
         })}
     </Paper>
 );
-
-function assertNotNull<T>(v: T | null | undefined): asserts v is Exclude<T, null | undefined> {
-    console.assert(v != null);
-}
 
 class CommentEventBus {
     public constructor(private eventListeners: Record<string, (c: Comment) => void> = {}) {}
@@ -100,7 +101,7 @@ const Comments: React.FC<CommentsProps> = ({ eventBus }) => {
         const id = eventBus.listen((c) => {
             setTryPutComment((old) => {
                 if (old != null) {
-                    console.warn("comment eventbus listener: TryPut collision");
+                    console.warn("comment eventbus listener: tryPut collision");
                 }
                 return c;
             });
@@ -108,14 +109,22 @@ const Comments: React.FC<CommentsProps> = ({ eventBus }) => {
         return () => eventBus.removeListener(id);
     }, [eventBus]);
 
+    // 1. Receive comment from `eventBus`.
+    // 2. Put it into `tryPutComment` and apply to DOM to measure its height.
+    // 3. Immediately call `useLayoutEffect` to update `shownCommentLayers`
+    // 4. Delete comments which will collide with.
+    // 5. Move comment `tryPutComment` to `shownCommentLayers`.
     React.useLayoutEffect(() => {
         if (tryPutComment == null) {
             return;
         }
 
-        // mesuring queued. let's measure its height and put it to desired layer.
-        assertNotNull(containerRef.current);
+        if (containerRef.current == null) {
+            return;
+        }
+
         const children = containerRef.current.children;
+        const containerHeight = containerRef.current.clientHeight;
 
         const target = children[0] as HTMLElement;
         const height = elementHeight(target);
@@ -125,7 +134,6 @@ const Comments: React.FC<CommentsProps> = ({ eventBus }) => {
         // |(0-1)| => |-1| => 1
         const alternateLayer = (x: number) => Math.abs(x - 1);
 
-        const containerHeight = containerRef.current.clientHeight;
         let oldLayer = alternateLayer(appendingLayer);
         let currentLayer = appendingLayer;
         let usedHeight = shownCommentLayers[currentLayer]
@@ -133,6 +141,16 @@ const Comments: React.FC<CommentsProps> = ({ eventBus }) => {
             .reduce((a, b) => a + b, 0);
 
         if (usedHeight + height > containerHeight) {
+            // Delete trailling comments
+            const count = shownCommentLayers[appendingLayer].filter(
+                (x) => x.top > usedHeight,
+            ).length;
+            setShownCommentLayers((comments) => {
+                for (let i = 0; i < count; i++) {
+                    comments[appendingLayer].pop();
+                }
+            });
+
             oldLayer = appendingLayer;
             currentLayer = alternateLayer(appendingLayer);
             usedHeight = 0;
@@ -142,7 +160,7 @@ const Comments: React.FC<CommentsProps> = ({ eventBus }) => {
 
         const oldLayerTop = shownCommentLayers[oldLayer].reduce(
             (a, b) => Math.min(a, b.top),
-            Infinity
+            Infinity,
         );
 
         const leftSpace = oldLayerTop - usedHeight;
@@ -162,12 +180,17 @@ const Comments: React.FC<CommentsProps> = ({ eventBus }) => {
             for (let i = 0; i < deleteCount; i++) {
                 comments[oldLayer].shift();
             }
-            comments[currentLayer].push({ top: usedHeight, height, comment: tryPutComment });
-            comments.forEach((x) => x.sort((a, b) => a.top - b.top));
+
+            comments[currentLayer].push({
+                height,
+                top: usedHeight,
+                comment: tryPutComment,
+            });
+
+            comments.forEach((layer) => layer.sort((a, b) => a.top - b.top));
         });
 
         setTryPutComment(null);
-
     }, [containerRef, shownCommentLayers, tryPutComment, appendingLayer, setShownCommentLayers]);
 
     const commentsOffset = (() => {
@@ -181,19 +204,25 @@ const Comments: React.FC<CommentsProps> = ({ eventBus }) => {
     const inner = [];
 
     if (tryPutComment != null) {
-        inner.push(<CommentPaper comment={tryPutComment} />);
+        inner.push(<CommentPaper key={tryPutComment.id} comment={tryPutComment} />);
     }
 
     inner.push(
-        ...shownCommentLayers.flatMap((x) =>
-            x.map((ct) => {
+        ...shownCommentLayers.flatMap((layer) =>
+            layer.map((comment) => {
                 const styles: React.CSSProperties = {
-                    top: `${ct.top + commentsOffset}px`,
+                    top: `${comment.top + commentsOffset}px`,
                     position: "absolute",
                 };
-                return <CommentPaper key={ct.comment.id} {...{ comment: ct.comment, styles }} />;
-            })
-        )
+                return (
+                    <CommentPaper
+                        key={comment.comment.id}
+                        comment={comment.comment}
+                        styles={styles}
+                    />
+                );
+            }),
+        ),
     );
 
     return (
@@ -206,46 +235,39 @@ const Comments: React.FC<CommentsProps> = ({ eventBus }) => {
 type Stats = {
     commentsPerSec: number;
     shownComments: number;
-}
+};
 
-const StatsPaper: React.FC<{stats: Stats | null}> = ({stats}) => (
+const StatsPaper: React.FC<{ stats: Stats | null }> = ({ stats }) => (
     <Paper className={styles["stats-container"]}>
         <p>total comments: {stats?.shownComments ?? 0}</p>
         <p>speed: {stats?.commentsPerSec?.toFixed(2) ?? "n/a"} comments/s</p>
     </Paper>
-)
+);
 
 type StatsEvent = {
     commentsPerSec: number;
-}
+};
 
-const Home: NextPage = () => {
-    // CSR for useLayoutEffect
-    const [visible, setVisible] = React.useState(false);
+const Home = () => {
+    const theme = React.useMemo(() => createTheme({ palette: { mode: "dark" } }), []);
     const [stats, setStats] = React.useState<StatsEvent | null>(null);
     const [commentCount, setCommentCount] = React.useState(0);
     const eventBus = React.useRef(new CommentEventBus());
 
     React.useEffect(() => {
-        setVisible(true);
         (async () => {
-            try {
-                const current = getCurrent()
-                await current.listen("comment", (e) => {
-                    const elements = (e as any).payload.elements as Array<CommentElement>;
-                    const comment = { id: nanoid(), elements };
-                    setCommentCount(x => x + 1);
-                    eventBus.current.emit(comment);
-                });
-                await current.listen("stats", (e) => {
-                    setStats((e as any).payload);
-                });
-            } catch (e) {
-                console.warn("i'm not on tauri! putting some sample comments");
-                for (const c of sampleComments) {
-                    setImmediate(() => eventBus.current.emit(c));
-                }
-            }
+            const current = getCurrent();
+
+            await current.listen("comment", (e) => {
+                const elements = (e as any).payload.elements as Array<CommentElement>;
+                const comment = { id: nanoid(), elements };
+                setCommentCount((x) => x + 1);
+                eventBus.current.emit(comment);
+            });
+
+            await current.listen("stats", (e) => {
+                setStats((e as any).payload);
+            });
         })();
     }, []);
 
@@ -253,31 +275,23 @@ const Home: NextPage = () => {
     if (stats != null) {
         propStats = {
             commentsPerSec: stats.commentsPerSec,
-            shownComments: commentCount
+            shownComments: commentCount,
         };
     }
 
-    return !visible ? null : (
-        <div className={styles["index-container"]}>
-            <Comments eventBus={eventBus.current} />
-            <StatsPaper stats={propStats} />
-        </div>
+    return (
+        <ThemeProvider theme={theme}>
+            <div className={styles["index-container"]}>
+                <Comments eventBus={eventBus.current} />
+                <StatsPaper stats={propStats} />
+            </div>
+        </ThemeProvider>
     );
 };
 
-const sampleComments: Array<Comment> = [
-    {
-        id: nanoid(),
-        elements: [{ type: "text", content: "This is a test text. AAAAAAAAAA" }],
-    },
-    {
-        id: nanoid(),
-        elements: [{ type: "text", content: "This is also test text. BBBBBBBBBBBBBBBBBBBB" }],
-    },
-    {
-        id: nanoid(),
-        elements: [{ type: "text", content: "This is the last test text. CCCC" }],
-    },
-];
-
-export default Home;
+ReactDOM.render(
+    <React.StrictMode>
+        <Home />
+    </React.StrictMode>,
+    document.getElementById("root"),
+);

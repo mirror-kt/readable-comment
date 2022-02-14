@@ -5,9 +5,7 @@
 
 use anyhow::{Context as _, Result};
 use headless_chrome::{
-    protocol::network::{
-        events::ResponseReceivedEventParams, methods::GetResponseBodyReturnObject,
-    },
+    protocol::cdp::Network::{events::ResponseReceivedEventParams, GetResponseBodyReturnObject},
     Browser, LaunchOptionsBuilder, Tab,
 };
 use std::{
@@ -45,7 +43,7 @@ fn main() -> Result<()> {
     });
 
     // failure::Error doesn't implement std::error::Error.
-    let (_browser, _tab) = YoutubeListener::new(Arc::clone(&context), todo!("put video id here"))
+    let (_browser, _tab) = YoutubeListener::new(Arc::clone(&context), "X6zqDeW_SGk".into())
         .start()
         .expect("failed to initialize youtube listener");
 
@@ -59,17 +57,6 @@ fn main() -> Result<()> {
         .expect("error while running tauri application");
 
     Ok(())
-}
-
-// a future that never ends.
-struct Empty;
-
-impl Future for Empty {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> {
-        Poll::Pending
-    }
 }
 
 struct YoutubeListenerInner {
@@ -95,7 +82,7 @@ impl YoutubeListener {
         }
     }
 
-    pub(crate) fn start(self) -> Result<(Browser, Arc<Tab>), failure::Error> {
+    pub(crate) fn start(self) -> Result<(Browser, Arc<Tab>)> {
         let opt = LaunchOptionsBuilder::default()
             .headless(false)
             .build()
@@ -113,12 +100,13 @@ impl YoutubeListener {
 
         tab.enable_response_handling(Box::new(move |a, b| self.on_response(a, b)))?;
 
-        // why this element has this too short ID?
+        // why this element has this too simple ID?
         tab.wait_for_element_with_custom_timeout("#label", Duration::from_secs(10))?
             .click()?;
 
         std::thread::sleep(Duration::from_millis(500));
 
+        // click "Live Chat" button to get all comments
         tab.wait_for_element("#menu > a:nth-child(2) > tp-yt-paper-item")?
             .click()?;
 
@@ -128,7 +116,7 @@ impl YoutubeListener {
     fn on_response(
         &self,
         param: ResponseReceivedEventParams,
-        fetch: &dyn Fn() -> Result<GetResponseBodyReturnObject, failure::Error>,
+        fetch: &dyn Fn() -> Result<GetResponseBodyReturnObject>,
     ) {
         if !param
             .response
@@ -159,7 +147,7 @@ impl YoutubeListener {
                     // We should return from this function as soon as possible because
                     // this `on_response` function is called by headless_chrome crate
                     // *synchronously in event loop*. Blocking on this function too long time
-                    // causes dropping browser event or connection lost.
+                    // causes dropping browser event or even connection lost.
                     // This is why using `spawn` instead of `block_on`.
                     let inner = Arc::clone(&self.inner);
                     self.inner
@@ -219,7 +207,7 @@ impl YoutubeListenerInner {
         }
     }
 
-    async fn emit(&self, event: &str, payload: impl serde::Serialize) {
+    async fn emit(&self, event: &str, payload: impl serde::Serialize + Clone) {
         let webview = self.ctx.webview.lock().await;
 
         if let Some(w) = webview.as_ref() {
@@ -292,13 +280,13 @@ impl YoutubeListenerInner {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Stats {
     comments_per_sec: f64,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SerializedComment<'a> {
     elements: Vec<CommentElement<'a>>,
@@ -314,7 +302,7 @@ impl<'a> SerializedComment<'a> {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "camelCase")]
 enum CommentElement<'a> {

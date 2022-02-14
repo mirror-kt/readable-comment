@@ -1,6 +1,6 @@
 html,
 body,
-#__next {
+#root {
     background-color: #151515;
     font-family: sans-serif;
     overflow-wrap: break-word;
