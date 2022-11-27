@@ -12,12 +12,12 @@ build = "src/build.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
-tauri-build = { version = "1.0.0-rc.1", features = [] }
+tauri-build = { version = "1.2.1", features = [] }
 
 [dependencies]
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-tauri = { version = "1.0.0-rc.1", features = [] }
+tauri = { version = "1.2.1", features = [] }
 headless_chrome = { git = "https://github.com/atroche/rust-headless-chrome.git" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
